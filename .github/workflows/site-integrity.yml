@@ -1,0 +1,91 @@
+name: LGR public-site integrity
+
+on:
+  schedule:
+    - cron: '17 0 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: lgr-public-site-integrity
+  cancel-in-progress: false
+
+jobs:
+  integrity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Compare both public pages with approved bytes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import ssl
+          import time
+          import urllib.error
+          import urllib.request
+          from datetime import datetime, timezone
+          
+          # Public pages only: no GitHub, Google, local-computer or market-data tokens.
+          EXPECTED = {
+              'https://yuuyaono2002.github.io/':
+                  '2eecd6008f6a017d08ef7beb238913d783c5417d104d2e54edfbf98f6ab403dd',
+              'https://yuuyaono2002.github.io/privacy.html':
+                  'd3a98da85d2f3f646c6adbeff47b3eaa1eaee2cd477bdaa5238e51d79dd812b5',
+          }
+          
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+          
+          def inspect_response(url, status, final_url, body):
+              result = {'url': url, 'http_status': status, 'bytes': len(body)}
+              if status != 200 or final_url != url:
+                  return dict(result, state='UNEXPECTED_RESPONSE')
+              if len(body) > 1048576:
+                  return dict(result, state='RESPONSE_TOO_LARGE')
+              actual = hashlib.sha256(body).hexdigest()
+              return dict(result, sha256=actual, expected_sha256=EXPECTED[url],
+                          state='MATCH' if actual == EXPECTED[url] else 'CONTENT_MISMATCH')
+          
+          def check(url):
+              opener = urllib.request.build_opener(
+                  NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+              # A second independent GET reduces transient network/CDN false positives.
+              for attempt in range(2):
+                  try:
+                      req = urllib.request.Request(url, headers={
+                          'User-Agent': 'LGR-Pages-Integrity/1.0',
+                          'Cache-Control': 'no-cache', 'Accept-Encoding': 'identity'})
+                      with opener.open(req, timeout=20) as response:
+                          result = inspect_response(url, response.status, response.url,
+                                                    response.read(1048577))
+                  except urllib.error.HTTPError as exc:
+                      result = {'url': url, 'state': 'HTTP_ERROR', 'http_status': exc.code}
+                  except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                      result = {'url': url, 'state': 'CHECK_UNAVAILABLE',
+                                'error_type': type(exc).__name__}
+                  if result['state'] == 'MATCH':
+                      return result
+                  if attempt == 0:
+                      time.sleep(10)
+              return result
+          
+          results = [check(url) for url in EXPECTED]
+          report = {'checked_at_utc': datetime.now(timezone.utc).isoformat(),
+                    'baseline_version': 'LGR-PAGES-20260927-v1',
+                    'state': 'PASS' if all(r['state'] == 'MATCH' for r in results) else 'ALERT',
+                    'results': results,
+                    'automatic_repair': False, 'baseline_auto_update': False}
+          print('LGR_SITE_CHECK_JSON=' + json.dumps(report, sort_keys=True))
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary:
+              with open(summary, 'a', encoding='utf-8') as out:
+                  out.write('## LGR public-site integrity\n\n```json\n')
+                  out.write(json.dumps(report, indent=2))
+                  out.write('\n```\n')
+          raise SystemExit(0 if report['state'] == 'PASS' else 1)
+          PY
